@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ICU 文案分支预览器</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="title">
+      <h1>ICU 文案分支预览器</h1>
+      <span class="subtitle">ICU MessageFormat Branch Previewer</span>
+    </div>
+    <div class="header-actions">
+      <button id="btnExport" class="btn btn-outline"
+              title="将模板、变量与全部分析结果导出为 JSON 文件">导出 JSON</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- 左：输入区 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>MessageFormat 模板</h2>
+        <span class="hint">支持嵌套 plural / select / selectordinal；<code>#</code> 表示复数数值；<code>'{</code> 转义花括号</span>
+      </div>
+      <div class="editor-wrap" id="editorWrap">
+        <pre id="highlight" aria-hidden="true"></pre>
+        {% raw %}<textarea id="template" spellcheck="false" wrap="soft"
+          placeholder="粘贴 ICU MessageFormat 模板，例如：{count, plural, one{# 条消息} other{# 条消息}}"></textarea>{% endraw %}
+      </div>
+      <div id="messages" class="messages"></div>
+
+      <div class="form-row">
+        <label class="field">
+          <span>语言环境（locale）</span>
+          <input id="locale" list="localeList" value="en" autocomplete="off">
+        </label>
+        <datalist id="localeList">
+          <option value="en"></option><option value="en-US"></option>
+          <option value="zh-Hans"></option><option value="zh-Hant"></option>
+          <option value="zh-CN"></option><option value="ja"></option>
+          <option value="ko"></option><option value="fr"></option>
+          <option value="de"></option><option value="es"></option>
+          <option value="it"></option><option value="pt"></option>
+          <option value="ru"></option><option value="uk"></option>
+          <option value="pl"></option><option value="cs"></option>
+          <option value="ar"></option><option value="he"></option>
+          <option value="hi"></option><option value="th"></option>
+          <option value="vi"></option><option value="tr"></option>
+          <option value="nl"></option><option value="sv"></option>
+        </datalist>
+        <button id="btnExtract" class="btn btn-outline"
+                title="把模板中使用到的变量自动加入下方样例列表">从模板提取变量</button>
+      </div>
+
+      <div class="panel-head">
+        <h2>变量样例</h2>
+        <span class="hint">数值自动识别；true/false 识别为布尔；其余按字符串</span>
+      </div>
+      <div id="varRows" class="var-rows"></div>
+      <button id="btnAddVar" class="btn btn-outline">＋ 添加变量</button>
+    </section>
+
+    <!-- 右：结果区 -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>样例渲染结果</h2>
+        <button id="btnCopyMain" class="btn btn-small" title="复制渲染结果">复制</button>
+      </div>
+      <div id="mainResult" class="main-result">—</div>
+      <div id="mainConds" class="chips"></div>
+
+      <div class="panel-head">
+        <h2>分支节点</h2>
+        <span id="stats" class="hint"></span>
+      </div>
+      <div id="nodes" class="nodes"></div>
+
+      <div class="panel-head">
+        <h2>可达分支路径</h2>
+        <button id="btnCopyAll" class="btn btn-small" title="复制全部路径的渲染结果">复制全部</button>
+      </div>
+      <div id="paths" class="paths"></div>
+    </section>
+  </main>
+
+  <!-- 场景集回归面板 -->
+  <section class="scenario-panel">
+    <div class="panel-head scenario-title-row">
+      <h2>场景集回归</h2>
+      <span class="hint">为当前模板保存多组带名称的 locale 与变量样例，一键批量分析并合并每条可达路径的覆盖状态（保存在浏览器本地）</span>
+      <div class="scenario-actions">
+        <button id="btnAddScenario" class="btn btn-outline">＋ 保存当前为场景</button>
+        <button id="btnRunScenarios" class="btn">▶ 运行全部场景</button>
+        <button id="btnExportScenarios" class="btn btn-outline"
+                title="导出包含场景定义与汇总结果的 JSON">导出场景 JSON</button>
+      </div>
+    </div>
+
+    <div class="scenario-grid">
+      <!-- 左：场景列表 -->
+      <div class="scenario-col">
+        <div class="panel-head">
+          <h3>场景列表 <span id="scenarioCount" class="hint"></span></h3>
+        </div>
+        <div id="scenarioList" class="scenario-list"></div>
+      </div>
+
+      <!-- 右：合并覆盖 -->
+      <div class="scenario-col">
+        <div class="panel-head">
+          <h3>合并路径覆盖</h3>
+          <span id="scenarioSummary" class="hint"></span>
+        </div>
+        <div id="scenarioProgress" class="scenario-progress" hidden>
+          <div id="scenarioProgressBar" class="scenario-progress-bar"></div>
+        </div>
+        <div id="scenarioPaths" class="scenario-paths">
+          <div class="empty">尚未运行场景集。保存场景后点击「运行全部场景」。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 版本对比面板 -->
+  <section class="compare-panel">
+    <div class="panel-head compare-title-row">
+      <h2>版本对比</h2>
+      <span class="hint">把当前模板设为基线后继续编辑，随时与基线对比：按变量名 / 分支类型 / 选择器及嵌套父链对齐语义路径（不依赖节点序号）；设为基线时会快照当前场景，对比时与当前场景合并在新旧两版分别回放（基线保存在浏览器本地）</span>
+      <div class="compare-actions">
+        <button id="btnSetBaseline" class="btn btn-outline"
+                title="把当前编辑器中的模板保存为对比基线">设为基线</button>
+        <button id="btnRunCompare" class="btn"
+                title="比较基线模板与当前模板，并回放全部已保存场景">与基线对比</button>
+        <button id="btnClearBaseline" class="btn btn-outline"
+                title="清除已保存的基线">清除基线</button>
+      </div>
+    </div>
+    <div class="compare-body">
+      <div id="baselineInfo" class="baseline-info"></div>
+      <div id="compareNotices"></div>
+      <div class="compare-grid">
+        <!-- 左：变更列表 -->
+        <div class="compare-col">
+          <div class="panel-head">
+            <h3>变更列表</h3>
+            <span id="compareSummary" class="hint"></span>
+          </div>
+          <div id="changeFilters" class="change-filters"></div>
+          <div id="changeList" class="change-list">
+            <div class="empty">尚未对比。设置基线并继续编辑后，点击「与基线对比」。</div>
+          </div>
+        </div>
+
+        <!-- 右：基线视图 + 场景回放 -->
+        <div class="compare-col">
+          <div class="panel-head">
+            <h3>基线模板</h3>
+            <span class="hint">点击变更可在此高亮基线片段，同时在编辑器中选中当前片段</span>
+          </div>
+          <pre id="baselineView" class="baseline-view">（未设置基线）</pre>
+          <div class="panel-head">
+            <h3>场景回放（两版分别运行）</h3>
+            <span id="compareScenarioSummary" class="hint"></span>
+          </div>
+          <div id="compareScenarios" class="compare-scenarios">
+            <div class="empty">对比时会把已保存的场景在基线版与当前版分别运行。</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 变量契约审计面板 -->
+  <section class="contract-panel">
+    <div class="panel-head contract-title-row">
+      <h2>变量契约审计</h2>
+      <span class="hint">从模板 AST 推导每个变量在简单占位 / number / plural / select / selectordinal 中的允许类型与必需性；导入多组场景样例，批量报告缺失变量、类型冲突、无效复数值及其首次出现位置，按变量聚合并生成可复制的 JSON Schema 草案</span>
+      <div class="contract-actions">
+        <input type="file" id="contractImportFile" accept=".json,application/json" hidden>
+        <button id="btnContractImport" class="btn btn-outline"
+                title="导入场景集导出文件，或直接导入场景数组 / {'scenarios': [...]}">导入场景 JSON</button>
+        <button id="btnContractUseScenarios" class="btn btn-outline"
+                title="使用上方「场景集回归」中已保存的全部场景">用已保存场景</button>
+        <button id="btnContractRun" class="btn"
+                title="按当前模板对导入的场景批量执行契约审计">运行审计</button>
+        <button id="btnContractCopySchema" class="btn btn-outline"
+                title="把推导生成的 JSON Schema 草案复制到剪贴板">复制 Schema</button>
+        <button id="btnContractExport" class="btn btn-outline"
+                title="导出包含模板、场景、变量契约与审计结果的 JSON 文件">导出审计 JSON</button>
+      </div>
+    </div>
+    <div class="contract-body">
+      <div id="contractNotices"></div>
+      <div id="contractMeta" class="contract-meta"></div>
+      <div class="contract-grid">
+        <!-- 左：审计场景 -->
+        <div class="contract-col">
+          <div class="panel-head">
+            <h3>审计场景 <span id="contractCount" class="hint"></span></h3>
+          </div>
+          <div id="contractScenarioList" class="contract-scenario-list">
+            <div class="empty">尚未导入场景。点「导入场景 JSON」选择场景集导出文件或场景数组，也可点「用已保存场景」直接使用上方保存的场景。</div>
+          </div>
+        </div>
+
+        <!-- 右：变量聚合 + Schema -->
+        <div class="contract-col">
+          <div class="panel-head">
+            <h3>按变量聚合 <span id="contractSummary" class="hint"></span></h3>
+          </div>
+          <div id="contractVars" class="contract-vars">
+            <div class="empty">尚未运行审计。导入场景后点「运行审计」。</div>
+          </div>
+          <div class="panel-head">
+            <h3>JSON Schema 草案</h3>
+            <span class="hint">draft-07；条件必需变量见 description</span>
+          </div>
+          <pre id="contractSchema" class="contract-schema">（运行审计后生成）</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div id="toast" class="toast"></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
