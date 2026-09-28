@@ -7,9 +7,12 @@
 - ``{name, select, ...}``             → string，并记录允许的分支键
 - 同一变量被 number 与 string 两类用法同时约束时，标记模板内类型冲突
 
-必需性：
-- 任一用法不处于任何分支节点守卫之下 → 必需（required）
-- 全部用法都在分支内 → 条件必需（conditional），记录守卫的语义路径
+必需性（按 AST 的完整分支路径推导，而非“是否写在分支内”）：
+- 在每条完整路径上都会被使用 → 必需（required）：
+  顶层用法自不必说；分支选择变量本身（plural/select/selectordinal 的属主、
+  plural 内的 #）在进入分支前就会被读取；同一变量在某分支节点的**每个**分支
+  中都被使用（允许分散在不同分支、允许嵌套）时同样必需。
+- 仅在部分分支路径上使用 → 条件必需（conditional），记录守卫的语义路径。
 
 场景校验批量产出三类问题（并记录其在模板与场景中的首次出现位置）：
 - missing_required / missing_conditional 缺失变量
@@ -115,7 +118,7 @@ class Usage:
 class Contract:
     name: str
     usages: list[Usage] = field(default_factory=list)
-    unconditional: bool = False
+    required: bool = False
     guards: list[str] = field(default_factory=list)  # 去重后的守卫语义路径
 
     @property
@@ -155,8 +158,95 @@ def _node_kind(node) -> str:
     return node.kind if isinstance(node, Plural) else "select"
 
 
+# 必需性路径分析的三态格：
+#   USE_NONE 该片段内任何路径都不使用变量
+#   USE_SOME 部分完整路径使用（即真正的“条件”）
+#   USE_ALL  每条完整路径都使用
+# 顺序组合取交（格上的 meet），分支组合同样取“各分支状态”的交，
+# 但分支节点的选择变量（含 plural 内 # 的属主）在进入分支前即被读取，
+# 对该节点整体恒为 USE_ALL。
+USE_NONE = 0
+USE_SOME = 1
+USE_ALL = 2
+
+
+def _meet(seq) -> int:
+    """顺序组合 / 交集：任意一段为 NONE 即 NONE；全为 ALL 才 ALL；否则 SOME。"""
+    state = USE_ALL
+    for s in seq:
+        if s < state:
+            state = s
+    return state
+
+
+def _branch_meet(states: list[int]) -> int:
+    """分支交集：每个分支都 ALL 才 ALL；全 NONE 才 NONE；否则 SOME。
+
+    空分支（没有任何内容的路径）视为不使用变量（NONE）。
+    """
+    if not states:
+        return USE_NONE
+    if all(s == USE_ALL for s in states):
+        return USE_ALL
+    if all(s == USE_NONE for s in states):
+        return USE_NONE
+    return USE_SOME
+
+
+def _usage_states(frag: list, plural_stack: list) -> dict[str, int]:
+    """返回该片段内每个变量在其完整路径集合上的使用态。
+
+    按 AST 的顺序组合（meet）与分支交集推导，
+    覆盖嵌套 select / plural / selectordinal 及同一变量分散在不同分支的情况。
+    """
+    states: dict[str, int] = {}
+
+    def combine(node_states: dict[str, int]):
+        # 顺序组合：逐变量与已有结果取交
+        for name, st in node_states.items():
+            if name in states:
+                states[name] = _meet((states[name], st))
+            else:
+                states[name] = st
+
+    for node in frag:
+        if isinstance(node, Arg):
+            if node.name and node.name != "?":
+                combine({node.name: USE_ALL})
+        elif isinstance(node, FmtArg):
+            if node.name and node.name != "?":
+                combine({node.name: USE_ALL})
+        elif isinstance(node, Hash):
+            if plural_stack:
+                combine({plural_stack[-1].name: USE_ALL})
+        elif isinstance(node, (Plural, Select)):
+            branch_states = [
+                _usage_states(
+                    b.message,
+                    plural_stack + [node] if isinstance(node, Plural)
+                    else plural_stack)
+                for b in node.branches]
+            all_names = set()
+            for bs in branch_states:
+                all_names.update(bs)
+            # 未出现该变量的分支按 NONE 计入分支交集
+            node_states: dict[str, int] = {
+                name: _branch_meet([bs.get(name, USE_NONE)
+                                    for bs in branch_states])
+                for name in all_names}
+            # 选择变量在分支选择时即被读取 → 节点整体每条路径都使用
+            node_states[node.name] = USE_ALL
+            combine(node_states)
+    return states
+
+
 def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
-    """遍历 AST，按变量收集用法、约束与分支守卫信息。"""
+    """遍历 AST，按变量收集用法、约束与分支守卫信息。
+
+    用法与守卫由一次带守卫链的遍历收集；必需性则由 ``_usage_states``
+    按顺序组合与分支交集推导：仅当变量在模板的每条完整路径上都会被使用时
+    才标记为必需。
+    """
     contracts: dict[str, Contract] = {}
 
     def get(name: str) -> Contract:
@@ -172,9 +262,7 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
             return
         c = get(name)
         c.usages.append(Usage(kind, pos, constraint, select))
-        if not guard_chain:
-            c.unconditional = True
-        else:
+        if guard_chain:
             guard = "/".join(guard_chain)
             if guard not in c.guards:
                 c.guards.append(guard)
@@ -211,6 +299,10 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
                          plural_stack)
 
     walk(parts, (), [])
+
+    for name, state in _usage_states(parts, []).items():
+        if name in contracts:
+            contracts[name].required = state == USE_ALL
     return contracts
 
 
@@ -241,8 +333,8 @@ def _contract_dict(name: str, c: Contract, template: str) -> dict:
     line, col = _line_col(template, c.first_pos)
     return {
         "name": name,
-        "required": c.unconditional,
-        "required_kind": "required" if c.unconditional else "conditional",
+        "required": c.required,
+        "required_kind": "required" if c.required else "conditional",
         "guards": c.guards,
         "resolved_type": resolved,
         "allowed_types": allowed_types(resolved, conflict),
@@ -294,7 +386,7 @@ def build_json_schema(items: list[dict]) -> dict:
         if c["required_kind"] == "conditional":
             guards = "；".join(c["guards"][:3])
             more = "…" if len(c["guards"]) > 3 else ""
-            desc += f"；条件必需（仅在分支 {guards}{more} 中使用）"
+            desc += f"；条件必需（仅在部分分支路径使用，如 {guards}{more}）"
         if c["type_conflict"]:
             desc += "；⚠ 模板内类型冲突：同时被要求为数字与字符串"
         if desc:
@@ -386,16 +478,17 @@ def evaluate_scenario(sc: dict, index: int, template: str,
         cd = contract_dicts[var_name]
         pos = c.first_pos
         if var_name not in variables:
-            if c.unconditional:
+            if c.required:
                 issues.append(_issue(
                     "missing_required", SEVERITY_ERROR,
-                    f"必需变量 '{var_name}' 缺失（在模板顶层使用）",
+                    f"必需变量 '{var_name}' 缺失"
+                    "（在模板的每条分支路径上都会被使用）",
                     var_name, sc, index, template, pos))
             else:
                 guard = c.guards[0] if c.guards else "某分支"
                 issues.append(_issue(
                     "missing_conditional", SEVERITY_WARNING,
-                    f"条件变量 '{var_name}' 缺失（仅在分支中使用，如 {guard}）",
+                    f"条件变量 '{var_name}' 缺失（仅在部分分支路径上使用，如 {guard}）",
                     var_name, sc, index, template, pos))
             continue
 

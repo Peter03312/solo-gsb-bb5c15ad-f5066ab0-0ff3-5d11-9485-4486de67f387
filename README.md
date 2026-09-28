@@ -31,24 +31,43 @@
   单侧解析或运行失败只保留该侧错误，不阻断其余场景。
 - **变量管理**：从模板一键提取变量；数值 / 布尔自动识别。
 - **变量契约审计**：从模板 AST 推导每个变量在简单占位、`number`、`plural`、
-  `select`、`selectordinal`（含 plural 内的 `#`）中的**允许类型与必需性**
-  （顶层使用为必需，仅在分支内使用为条件必需并记录守卫路径）；同一变量被
-  数字用法与字符串用法同时约束时报告模板内类型冲突。支持**导入多组场景样例**
-  （场景集导出文件、场景数组或 `{"scenarios": [...]}`），批量报告缺失变量、
-  类型冲突、无效复数值、无匹配的 select 键（含非法场景），并给出每个问题在
-  模板与场景中的**首次出现位置**；结果**按变量聚合**（问题类型、出现次数、
-  首次场景与全部出现场景），同时生成可一键复制的 **JSON Schema 草案**
-  （draft-07，无 `other` 兜底的 select 输出 `enum`），并可导出完整审计 JSON。
+  `select`、`selectordinal`（含 plural 内的 `#`）中的**允许类型与必需性**。
+  必需性按 AST 的**顺序组合与分支交集**推导：变量在每条完整分支路径上都会被
+  使用即为必需——顶层用法、分支选择变量本身（plural/select/selectordinal 的
+  属主、plural 内的 `#`），以及写在分支内但**每个分支都会用到**（允许嵌套、
+  允许同一变量分散在不同分支）的变量都算必需；仅在部分路径使用的变量才是条件
+  必需并记录守卫路径。同一变量被数字用法与字符串用法同时约束时报告模板内类型
+  冲突。支持**导入多组场景样例**（场景集导出文件、场景数组或
+  `{"scenarios": [...]}`），批量报告缺失变量、类型冲突、无效复数值、无匹配的
+  select 键（含非法场景），并给出每个问题在模板与场景中的**首次出现位置**；
+  缺失必需变量为错误（`error`）、缺失条件变量为警告（`warning`），结果
+  **按变量聚合**（问题类型、出现次数、首次场景与全部出现场景），同时生成可
+  一键复制的 **JSON Schema 草案**（draft-07，必需变量进入 `required`，
+  无 `other` 兜底的 select 输出 `enum`），并可导出完整审计 JSON。
 - **复制与导出**：复制单条或全部渲染结果；一键导出包含模板、变量与完整
   分析结果的 JSON 文件；场景集可单独导出为回归报告 JSON。
 
 ## 快速开始
 
-### 方式一：Docker Compose（推荐）
+### 方式一：Docker Compose（推荐，一条命令启动）
+
+前置要求：已安装 Docker（含 Compose 插件）。无需手动安装 Python 或依赖，
+镜像构建与服务启动全部由 Compose 完成：
 
 ```bash
 docker compose up --build
 ```
+
+启动后在浏览器打开：**http://localhost:5000**
+
+必要配置（均已内置默认值，通常无需修改，见 `docker-compose.yml`）：
+
+- 端口映射 `5000:5000`：宿主机与容器均使用 5000 端口；
+- 环境变量 `PORT=5000`：容器内 gunicorn 监听端口，需与 `ports` 右侧端口一致；
+  若宿主机想换端口（如 8080），把映射改为 `"8080:5000"` 即可，容器内 `PORT`
+  保持 5000。
+
+加 `-d` 可后台运行（`docker compose up -d --build`），停止用 `docker compose down`。
 
 ### 方式二：Docker
 
@@ -66,9 +85,9 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
 
 ### 访问
 
-启动后在浏览器打开：**http://localhost:5000**
+以上任一方式启动后，在浏览器打开：**http://localhost:5000**
 
-端口可通过环境变量 `PORT` 修改（Compose 中需同步调整 `ports` 映射）。
+本地直接运行时，端口可通过环境变量 `PORT` 修改（如 `PORT=8080 python app.py`）。
 
 ## 使用说明
 
@@ -147,8 +166,12 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
    - **允许类型**：简单占位 → 任意标量（字符串 / 数字 / 布尔）；`number`、
      `plural`、`selectordinal`（及 plural 内的 `#`）→ 数字；`select` → 字符串；
      `date` / `time` / `spellout` / `ordinal` / `duration` → 任意标量；
-   - **必需性**：不处于任何分支守卫下的变量为**必需**；仅出现在分支内的为
-     **条件必需**，并记录守卫的语义路径（如 `gender:select@male/count:plural@one`）；
+   - **必需性**：按 AST 的顺序组合与分支交集推导。变量在**每条完整分支路径**
+     上都会被使用即为**必需**：不处于任何分支守卫下的用法、分支选择变量本身
+     （`plural` / `selectordinal` / `select` 的属主、plural 内 `#`），以及
+     写在分支内但每个分支都会用到的变量（支持嵌套、支持同一变量分散在不同
+     分支）都算必需；仅在部分路径出现的变量为**条件必需**，并记录守卫的语义
+     路径（如 `gender:select@male/count:plural@one`）；
    - **select 分支键**：收集允许的键，并标注是否缺少 `other` 兜底；
    - **模板内类型冲突**：同一变量同时被要求为数字（number/plural）与字符串
      （select）时直接标红。
@@ -248,16 +271,19 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
   - `template_ok` / `errors`：模板是否可解析及带行列号的语法错误（有错误时
     契约仍基于可恢复 AST 推导）；
   - `contracts`：按首次出现顺序排列的变量契约，每项含 `name`、`required` /
-    `required_kind`（`required` / `conditional`）、`guards`（守卫语义路径）、
-    `resolved_type`（`number` / `string` / `any` / `conflict`）、
-    `allowed_types`、`type_conflict`、`usage_kinds` / `usage_labels`、
-    `select.selectors` / `select.has_other`、首次出现位置
+    `required_kind`（`required` 表示在每条完整分支路径上都会被使用——含分支
+    内但所有分支都使用的情况；`conditional` 表示仅部分路径使用）、`guards`
+    （条件必需变量的守卫语义路径）、`resolved_type`（`number` / `string` /
+    `any` / `conflict`）、`allowed_types`、`type_conflict`、`usage_kinds` /
+    `usage_labels`、`select.selectors` / `select.has_other`、首次出现位置
     `first_pos` / `first_line` / `first_col`；
   - `template_issues`：模板内类型冲突（`template_type_conflict`），与场景无关；
   - `scenarios`：每个场景的 `status`（`passed` / `failed`）、各严重级别计数与
     `issues` 明细；
-  - `issues`：全部场景问题的扁平列表，`code` 取值为 `missing_required` /
-    `missing_conditional` / `type_conflict` / `invalid_plural_value` /
+  - `issues`：全部场景问题的扁平列表，`code` 取值为 `missing_required`
+    （每条路径都会使用的变量缺失，严重级别 `error`，与契约 `required` 和
+    JSON Schema `required` 完全一致）/ `missing_conditional`（仅部分路径使用
+    的条件变量缺失，`warning`）/ `type_conflict` / `invalid_plural_value` /
     `invalid_selector` / `unused_variable` / `invalid_scenario`，每项含
     `severity`（`error` / `warning` / `info`）、`message`、`variable`、
     `scenario`（首次出现的场景：`index` / `id` / `name`）以及模板首次出现
