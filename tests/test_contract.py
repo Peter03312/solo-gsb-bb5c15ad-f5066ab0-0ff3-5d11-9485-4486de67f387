@@ -46,6 +46,101 @@ def test_conditional_variable_inside_branch():
     assert any(p.startswith("g:select@a") for p in by_name["inner"]["guards"])
 
 
+def test_used_in_every_select_branch_is_required():
+    # x 语法上只写在分支内，但每条完整路径都会使用 → 必需
+    tpl = "{g, select, a{值是{x}} b{值为{x}} other{其他{x}}}"
+    r = audit_contract(tpl, [])
+    by_name = {c["name"]: c for c in r["contracts"]}
+    assert by_name["g"]["required"] is True
+    assert by_name["x"]["required"] is True
+    assert by_name["x"]["required_kind"] == "required"
+    # 守卫路径仍然记录（用法确实写在分支内）
+    assert by_name["x"]["guards"]
+    assert r["summary"]["required_total"] == 2
+    assert r["summary"]["conditional_total"] == 0
+    assert "x" in r["json_schema"]["required"]
+
+
+def test_used_in_only_some_select_branches_is_conditional():
+    tpl = "{g, select, a{{x, number}} b{无} other{无}}"
+    r = audit_contract(tpl, [])
+    x = {c["name"]: c for c in r["contracts"]}["x"]
+    assert x["required"] is False
+    assert x["required_kind"] == "conditional"
+    assert "x" not in r["json_schema"]["required"]
+
+
+def test_variable_split_across_branches_covers_all_is_required():
+    # 同一变量分散在不同分支的内层节点里，合起来覆盖外层每条路径 → 必需
+    tpl = (
+        "{g, select, "
+        "a{{h, select, p{{v}} other{{v}}}} "
+        "b{{h, select, q{{v}} other{{v}}}} "
+        "other{{v}}}"
+    )
+    r = audit_contract(tpl, [])
+    by_name = {c["name"]: c for c in r["contracts"]}
+    assert by_name["v"]["required"] is True
+    assert "v" in r["json_schema"]["required"]
+    # h 只在 a/b 分支出现 → 仍是条件必需
+    assert by_name["h"]["required"] is False
+    assert by_name["h"]["required_kind"] == "conditional"
+
+
+def test_nested_plural_hash_intersection():
+    # 内层 plural 的选择变量 m 在每条外层路径都会被求值 → 必需
+    tpl = ("{n, plural, "
+           "one{{m, plural, one{#/#} other{#/#}}} "
+           "other{{m, plural, one{#} other{#}}}}")
+    r = audit_contract(tpl, [])
+    by_name = {c["name"]: c for c in r["contracts"]}
+    assert by_name["n"]["required"] is True
+    assert by_name["m"]["required"] is True
+    assert set(r["json_schema"]["required"]) == {"n", "m"}
+
+
+def test_nested_selectordinal_all_branches_required():
+    tpl = "{p, selectordinal, one{{x}} two{{x}} few{{x}} other{{x}}}"
+    r = audit_contract(tpl, [])
+    by_name = {c["name"]: c for c in r["contracts"]}
+    assert by_name["x"]["required"] is True
+    assert by_name["x"]["usage_kinds"] == ["simple"] * 4
+
+
+def test_deep_intersection_requires_all_paths():
+    # 内层 select 只有部分分支使用 v → v 不是每条路径都用 → 条件必需
+    tpl = ("{g, select, "
+           "a{{h, select, p{{v}} other{无}}} "
+           "other{{h, select, r{{v}} other{{v}}}}}")
+    r = audit_contract(tpl, [])
+    by_name = {c["name"]: c for c in r["contracts"]}
+    assert by_name["v"]["required"] is False
+    assert by_name["v"]["required_kind"] == "conditional"
+
+
+def test_missing_all_paths_variable_is_error_and_required_consistent():
+    tpl = "{g, select, a{{x}} other{{x}}}"
+    r = audit_contract(tpl, [
+        {"name": "缺 x", "locale": "en", "variables": {"g": "a"}},
+        {"name": "齐全", "locale": "en", "variables": {"g": "a", "x": 1}},
+    ])
+    scenarios = {s["name"]: s for s in r["scenarios"]}
+    assert scenarios["缺 x"]["status"] == "failed"
+    issue = next(i for i in scenarios["缺 x"]["issues"] if i["variable"] == "x")
+    assert issue["code"] == "missing_required"
+    assert issue["severity"] == "error"
+    assert scenarios["齐全"]["status"] == "passed"
+    # 契约 / 问题等级 / Schema 三处一致
+    x_contract = next(c for c in r["contracts"] if c["name"] == "x")
+    assert x_contract["required"] is True
+    assert "x" in r["json_schema"]["required"]
+    var_entry = next(v for v in r["variables"]
+                     if v["contract"]["name"] == "x")
+    group = next(g for g in var_entry["groups"]
+                 if g["code"] == "missing_required")
+    assert group["severity"] == "error"
+
+
 def test_simple_placeholder_is_any_scalar():
     r = audit_contract("{name}-{d, date}", [])
     by_name = {c["name"]: c for c in r["contracts"]}

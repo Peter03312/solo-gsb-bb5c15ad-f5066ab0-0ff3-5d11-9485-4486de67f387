@@ -32,8 +32,10 @@
 - **变量管理**：从模板一键提取变量；数值 / 布尔自动识别。
 - **变量契约审计**：从模板 AST 推导每个变量在简单占位、`number`、`plural`、
   `select`、`selectordinal`（含 plural 内的 `#`）中的**允许类型与必需性**
-  （顶层使用为必需，仅在分支内使用为条件必需并记录守卫路径）；同一变量被
-  数字用法与字符串用法同时约束时报告模板内类型冲突。支持**导入多组场景样例**
+  （按 AST 的顺序组合取并集、分支取交集推导：顶层使用、或虽只写在分支内但
+  **每条完整分支路径**都会使用的变量为必需；仅在部分路径使用的为条件必需，
+  并记录守卫路径）；同一变量被数字用法与字符串用法同时约束时报告模板内类型
+  冲突。支持**导入多组场景样例**
   （场景集导出文件、场景数组或 `{"scenarios": [...]}`），批量报告缺失变量、
   类型冲突、无效复数值、无匹配的 select 键（含非法场景），并给出每个问题在
   模板与场景中的**首次出现位置**；结果**按变量聚合**（问题类型、出现次数、
@@ -44,11 +46,18 @@
 
 ## 快速开始
 
-### 方式一：Docker Compose（推荐）
+### 方式一：Docker Compose（推荐，一条命令启动）
+
+前置条件：已安装 Docker 与 Docker Compose 插件（`docker compose version`
+可用）。无需在本机准备 Python 环境，镜像构建会自动安装全部依赖。
 
 ```bash
 docker compose up --build
 ```
+
+首次运行会构建镜像（安装 Flask / Babel / gunicorn），随后在前台启动服务；
+停止按 `Ctrl+C`，后台常驻可改用 `docker compose up --build -d`。启动成功后
+浏览器打开：**http://localhost:5000**
 
 ### 方式二：Docker
 
@@ -59,16 +68,24 @@ docker run --rm -p 5000:5000 icu-branch-previewer
 
 ### 方式三：本地运行
 
+前置条件：Python 3.10+（`pip install -r requirements.txt` 安装 Flask、Babel
+与 gunicorn）。
+
 ```bash
 pip install -r requirements.txt
 python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
 ```
 
-### 访问
+### 访问与配置
 
 启动后在浏览器打开：**http://localhost:5000**
 
-端口可通过环境变量 `PORT` 修改（Compose 中需同步调整 `ports` 映射）。
+- 无需任何必填配置：默认监听 `0.0.0.0:5000`，CLDR 复数数据由 Babel 内置提供。
+- 唯一可选环境变量为 `PORT`（默认 `5000`）：本地运行时
+  `PORT=8000 python app.py` 即可改端口；使用 Compose 时需同步修改
+  `docker-compose.yml` 中的 `ports` 映射（如 `"8000:8000"`）与
+  `environment.PORT`。
+- 健康检查：`GET http://localhost:5000/api/health` 返回 `{"status": "ok"}`。
 
 ## 使用说明
 
@@ -147,8 +164,11 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
    - **允许类型**：简单占位 → 任意标量（字符串 / 数字 / 布尔）；`number`、
      `plural`、`selectordinal`（及 plural 内的 `#`）→ 数字；`select` → 字符串；
      `date` / `time` / `spellout` / `ordinal` / `duration` → 任意标量；
-   - **必需性**：不处于任何分支守卫下的变量为**必需**；仅出现在分支内的为
-     **条件必需**，并记录守卫的语义路径（如 `gender:select@male/count:plural@one`）；
+   - **必需性**：按 AST 的顺序组合（并集）与分支交集推导——变量在模板顶层
+     使用、或虽只写在 `select` / `plural` / `selectordinal` 分支内但**每条
+     完整分支路径**都会使用（含嵌套分支、同一变量分散在不同分支但合起来覆盖
+     全部路径的情况）时为**必需**；仅在部分路径使用时为**条件必需**，并记录
+     守卫的语义路径（如 `gender:select@male/count:plural@one`）；
    - **select 分支键**：收集允许的键，并标注是否缺少 `other` 兜底；
    - **模板内类型冲突**：同一变量同时被要求为数字（number/plural）与字符串
      （select）时直接标红。
@@ -248,7 +268,9 @@ python app.py            # 或：gunicorn --bind 0.0.0.0:5000 app:app
   - `template_ok` / `errors`：模板是否可解析及带行列号的语法错误（有错误时
     契约仍基于可恢复 AST 推导）；
   - `contracts`：按首次出现顺序排列的变量契约，每项含 `name`、`required` /
-    `required_kind`（`required` / `conditional`）、`guards`（守卫语义路径）、
+    `required_kind`（`required` = 在每条完整分支路径上都会使用，含只写在
+    分支内但被所有路径覆盖的变量；`conditional` = 仅部分路径使用）、
+    `guards`（守卫语义路径，必需变量若用法都在分支内也会记录）、
     `resolved_type`（`number` / `string` / `any` / `conflict`）、
     `allowed_types`、`type_conflict`、`usage_kinds` / `usage_labels`、
     `select.selectors` / `select.has_other`、首次出现位置

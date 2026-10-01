@@ -7,9 +7,15 @@
 - ``{name, select, ...}``             → string，并记录允许的分支键
 - 同一变量被 number 与 string 两类用法同时约束时，标记模板内类型冲突
 
-必需性：
-- 任一用法不处于任何分支节点守卫之下 → 必需（required）
-- 全部用法都在分支内 → 条件必需（conditional），记录守卫的语义路径
+必需性（按 AST 的顺序组合与分支交集推导）：
+- 一个片段「必然使用」的变量集合 = 顺序节点取并集、分支节点取各分支集合的交集
+  （plural/select 节点的选择变量本身在每个分支之外被求值，故总是必然使用）。
+- 出现在顶层片段必然使用集合中的变量 → 必需（required），即使它的每一处用法
+  语法上都写在分支内（只要每条完整分支路径都会经过该用法）。
+- 仅在部分路径上使用（不进入必然使用集合）的变量 → 条件必需（conditional），
+  记录其所在用法的守卫语义路径。
+- 该推导基于 AST 结构本身（顺序组合 = 并集，分支 = 交集），不依赖具体语言环境
+  下复数类别的可达性。
 
 场景校验批量产出三类问题（并记录其在模板与场景中的首次出现位置）：
 - missing_required / missing_conditional 缺失变量
@@ -115,7 +121,8 @@ class Usage:
 class Contract:
     name: str
     usages: list[Usage] = field(default_factory=list)
-    unconditional: bool = False
+    # 是否在模板的每条完整分支路径上都会被使用（AST 顺序组合/分支交集推导）
+    required: bool = False
     guards: list[str] = field(default_factory=list)  # 去重后的守卫语义路径
 
     @property
@@ -156,7 +163,12 @@ def _node_kind(node) -> str:
 
 
 def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
-    """遍历 AST，按变量收集用法、约束与分支守卫信息。"""
+    """遍历 AST，按变量收集用法、约束与分支守卫信息。
+
+    必需性分两步：先收集每个变量的全部用法及其守卫链，再用
+    :func:`guaranteed_vars` 按「顺序组合取并集、分支取交集」计算模板每条
+    完整路径上都会使用的变量集合，据此标记 required。
+    """
     contracts: dict[str, Contract] = {}
 
     def get(name: str) -> Contract:
@@ -172,9 +184,7 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
             return
         c = get(name)
         c.usages.append(Usage(kind, pos, constraint, select))
-        if not guard_chain:
-            c.unconditional = True
-        else:
+        if guard_chain:
             guard = "/".join(guard_chain)
             if guard not in c.guards:
                 c.guards.append(guard)
@@ -211,7 +221,63 @@ def derive_contracts(template: str, parts: list) -> dict[str, Contract]:
                          plural_stack)
 
     walk(parts, (), [])
+
+    # 按 AST 顺序组合 / 分支交集求「每条完整路径必然使用」的变量集合
+    for name in guaranteed_vars(parts, []):
+        if name in contracts:
+            contracts[name].required = True
     return contracts
+
+
+def _intersect_all(sets: list[set[str]]) -> set[str]:
+    """多个分支集合的交集；没有任何分支（解析恢复场景）时交集为空。"""
+    if not sets:
+        return set()
+    result = set(sets[0])
+    for s in sets[1:]:
+        result &= s
+    return result
+
+
+def guaranteed_vars(frag: list, plural_stack: list) -> set[str]:
+    """返回片段 frag 在**每条**执行路径上都会使用的变量名集合。
+
+    - 顺序组合：各节点必然集合取并集（先到的节点即使因变量缺失而渲染失败，
+      其变量求值本身仍然发生，故按并集处理）；
+    - plural / select 分支：选择变量必然使用，分支体的必然集合取各分支交集
+      （同一变量分散在不同分支、合起来覆盖全部分支时也会命中）；
+    - plural 内的 ``#`` 归属于其所在 plural 的选择变量。
+    """
+    used: set[str] = set()
+    for node in frag:
+        if isinstance(node, Arg):
+            if node.name and node.name != "?":
+                used.add(node.name)
+        elif isinstance(node, FmtArg):
+            if node.name and node.name != "?":
+                used.add(node.name)
+        elif isinstance(node, Hash):
+            if plural_stack:
+                owner = plural_stack[-1].name
+                if owner and owner != "?":
+                    used.add(owner)
+        elif isinstance(node, Plural):
+            if node.name and node.name != "?":
+                used.add(node.name)  # 选择变量在分支分派前必然求值
+            branch_sets = [
+                guaranteed_vars(b.message, plural_stack + [node])
+                for b in node.branches
+            ]
+            used |= _intersect_all(branch_sets)
+        elif isinstance(node, Select):
+            if node.name and node.name != "?":
+                used.add(node.name)
+            branch_sets = [
+                guaranteed_vars(b.message, plural_stack)
+                for b in node.branches
+            ]
+            used |= _intersect_all(branch_sets)
+    return used
 
 
 def _resolved_type(c: Contract) -> tuple[str, bool]:
@@ -241,8 +307,8 @@ def _contract_dict(name: str, c: Contract, template: str) -> dict:
     line, col = _line_col(template, c.first_pos)
     return {
         "name": name,
-        "required": c.unconditional,
-        "required_kind": "required" if c.unconditional else "conditional",
+        "required": c.required,
+        "required_kind": "required" if c.required else "conditional",
         "guards": c.guards,
         "resolved_type": resolved,
         "allowed_types": allowed_types(resolved, conflict),
@@ -294,7 +360,9 @@ def build_json_schema(items: list[dict]) -> dict:
         if c["required_kind"] == "conditional":
             guards = "；".join(c["guards"][:3])
             more = "…" if len(c["guards"]) > 3 else ""
-            desc += f"；条件必需（仅在分支 {guards}{more} 中使用）"
+            desc += f"；条件必需（仅在部分分支路径使用，如 {guards}{more}）"
+        elif c["guards"]:
+            desc += "；必需（每条分支路径都会使用，用法均位于分支内）"
         if c["type_conflict"]:
             desc += "；⚠ 模板内类型冲突：同时被要求为数字与字符串"
         if desc:
@@ -386,16 +454,18 @@ def evaluate_scenario(sc: dict, index: int, template: str,
         cd = contract_dicts[var_name]
         pos = c.first_pos
         if var_name not in variables:
-            if c.unconditional:
+            if c.required:
                 issues.append(_issue(
                     "missing_required", SEVERITY_ERROR,
-                    f"必需变量 '{var_name}' 缺失（在模板顶层使用）",
+                    f"必需变量 '{var_name}' 缺失"
+                    + ("（在模板顶层使用）" if not c.guards
+                       else "（每条分支路径都会使用）"),
                     var_name, sc, index, template, pos))
             else:
                 guard = c.guards[0] if c.guards else "某分支"
                 issues.append(_issue(
                     "missing_conditional", SEVERITY_WARNING,
-                    f"条件变量 '{var_name}' 缺失（仅在分支中使用，如 {guard}）",
+                    f"条件变量 '{var_name}' 缺失（仅在部分分支路径使用，如 {guard}）",
                     var_name, sc, index, template, pos))
             continue
 
